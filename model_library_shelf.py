@@ -1,16 +1,13 @@
 bl_info = {
     "name": "Model Library Shelf",
     "author": "Olivershot1",
-    "version": (1, 0, 0),
+    "version": (1, 5, 0),
     "blender": (4, 0, 0),
     "location": "Ctrl+Shift+L opens/closes the Asset Browser at the bottom",
     "description": "Bottom Asset Browser for your own models: save selected objects with textures, folders (catalogs), search",
     "category": "Import-Export",
 }
 
-#------------------------------------
-# Still issue with the texures trying to make it as smooth as in can should be fixed for the next update i hope.
-#------------------------------------
 import math
 import os
 import re
@@ -22,7 +19,7 @@ import uuid
 import bpy
 import gpu
 import numpy as np
-from bpy.props import EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel
 from mathutils import Matrix, Vector
 
@@ -144,7 +141,7 @@ def ensure_catalog(lib_dir, catalog_path):
 
 # ----------------------------------------------------------------------------
 # Thumbnail with textures
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------- 
 
 def find_view3d(context):
     area = context.area if (context.area and context.area.type == 'VIEW_3D') else None
@@ -299,7 +296,7 @@ def sync_blend_catalog(blend, cat_id):
     try:
         res = subprocess.run(
             [bpy.app.binary_path, "-b", "--factory-startup", "--python", script,
-             "--", blend, cat_id],
+            "--", blend, cat_id],
             capture_output=True, text=True, timeout=180,
         )
         if res.returncode != 0:
@@ -353,6 +350,72 @@ class MODELLIB_OT_new_folder(Operator):
         return {'FINISHED'}
 
 
+_delete_folder_items_cache = []
+
+
+def _delete_folder_items(self, context):
+    items = [(p, p, "") for p in read_catalog_paths(get_lib_dir())]
+    if not items:
+        items = [("", "(no folders yet)", "")]
+    _delete_folder_items_cache[:] = items
+    return _delete_folder_items_cache
+
+
+class MODELLIB_OT_delete_folder(Operator):
+    bl_idname = "modellib.delete_folder"
+    bl_label = "Delete Folder"
+    bl_description = "Delete a folder from your library, on disk and from Blender's folder list"
+
+    folder: EnumProperty(name="Folder", items=_delete_folder_items)
+    confirm_delete_contents: BoolProperty(
+        name="Delete its files too",
+        description="This folder has files in it - tick to permanently delete them as well",
+        default=False,
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        self.layout.prop(self, "folder")
+        if self.folder:
+            path = os.path.join(get_lib_dir(), *_catalog_parts(self.folder))
+            if os.path.isdir(path) and os.listdir(path):
+                self.layout.label(text="This folder has files in it.", icon='ERROR')
+                self.layout.prop(self, "confirm_delete_contents")
+
+    def execute(self, context):
+        if not self.folder:
+            self.report({'WARNING'}, "Pick a folder to delete")
+            return {'CANCELLED'}
+
+        lib = get_lib_dir()
+        path = os.path.join(lib, *_catalog_parts(self.folder))
+
+        if os.path.isdir(path):
+            if os.listdir(path) and not self.confirm_delete_contents:
+                self.report({'WARNING'}, "That folder isn't empty - tick 'Delete its files too' to confirm")
+                return {'CANCELLED'}
+            try:
+                shutil.rmtree(path)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not delete folder: {e}")
+                return {'CANCELLED'}
+
+        entries = read_catalog_lines(lib)
+        prefix = self.folder + "/"
+        kept = [e for e in entries if e[1] != self.folder and not e[1].startswith(prefix)]
+        write_catalog_lines(lib, kept)
+        try:
+            bpy.ops.asset.catalogs_save()
+        except Exception:
+            pass
+
+        refresh_asset_browsers(context)
+        self.report({'INFO'}, f"Deleted folder '{self.folder}'")
+        return {'FINISHED'}
+
+
 class MODELLIB_OT_detect_folders(Operator):
     bl_idname = "modellib.detect_folders"
     bl_label = "Detect Folders"
@@ -361,6 +424,9 @@ class MODELLIB_OT_detect_folders(Operator):
 
     def execute(self, context):
         lib = get_lib_dir()
+
+        # 0. Remove folders that were deleted on disk from Blender's folder list.
+        removed = prune_missing_catalogs(lib)
 
         # 1. Register every physical folder as a catalog.
         for dirpath, dirnames, filenames in os.walk(lib):
@@ -392,7 +458,7 @@ class MODELLIB_OT_detect_folders(Operator):
                     updated += 1
 
         refresh_asset_browsers(context)
-        self.report({'INFO'}, f"Checked {checked} file(s), updated {updated}")
+        self.report({'INFO'}, f"Checked {checked} file(s), updated {updated}, removed {removed} missing folder(s)")
         return {'FINISHED'}
 
 
@@ -559,6 +625,105 @@ class MODELLIB_OT_set_preview_shape(Operator):
         refresh_asset_browsers(context)
         if done:
             self.report({'INFO'}, f"Updated preview for {done} asset(s)")
+        return {'FINISHED'}
+
+
+class MODELLIB_OT_save_material(Operator):
+    bl_idname = "modellib.save_material"
+    bl_label = "Save Material(s) to Library"
+    bl_description = "Save the material(s) already on the selected object(s) into your library"
+
+    catalog: StringProperty(
+        name="Folder",
+        description="Folder inside the library, e.g.  Textures/Metal  (leave empty for Unassigned)",
+        default="",
+    )
+    shape: EnumProperty(
+        name="Preview Shape",
+        description="Shape the preview thumbnail shows the material on",
+        items=[('SPHERE', "Sphere", ""), ('CUBE', "Cube", ""), ('PLANE', "Plane", "")],
+        default='SPHERE',
+    )
+
+    _mats = []
+
+    @classmethod
+    def poll(cls, context):
+        for o in context.selected_objects:
+            for slot in getattr(o, "material_slots", []):
+                if slot.material:
+                    return True
+        return False
+
+    def invoke(self, context, event):
+        mats, seen = [], set()
+        for o in context.selected_objects:
+            for slot in getattr(o, "material_slots", []):
+                m = slot.material
+                if m and m.name not in seen:
+                    seen.add(m.name)
+                    mats.append(m)
+        if not mats:
+            self.report({'WARNING'}, "The selected object(s) have no materials")
+            return {'CANCELLED'}
+        MODELLIB_OT_save_material._mats = mats
+        return context.window_manager.invoke_props_dialog(self, width=340)
+
+    def draw(self, context):
+        mats = MODELLIB_OT_save_material._mats
+        names = ", ".join(m.name for m in mats[:3]) + (", ..." if len(mats) > 3 else "")
+        self.layout.label(text=f"Saving {len(mats)} material(s): {names}")
+        self.layout.prop(self, "shape")
+        self.layout.prop(self, "catalog")
+
+    def execute(self, context):
+        ensure_library()
+        folder = get_lib_dir()
+        save_dir = catalog_folder(folder, self.catalog) if self.catalog.strip() else folder
+
+        cat_id = NULL_UUID
+        if self.catalog.strip():
+            uid = ensure_catalog(folder, self.catalog)
+            if uid:
+                cat_id = uid
+
+        saved = 0
+        for mat in MODELLIB_OT_save_material._mats:
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                        try:
+                            node.image.pack()
+                        except Exception:
+                            pass
+
+            base = re.sub(r'[\\/:*?"<>|]', "_", mat.name).strip() or "Material"
+            safe, n = base, 1
+            while os.path.exists(os.path.join(save_dir, safe + ".blend")):
+                safe = f"{base}.{n:03d}"
+                n += 1
+            blend_path = os.path.join(save_dir, safe + ".blend")
+
+            mat_copy = mat.copy()
+            mat_copy.name = safe
+            mat_copy.asset_mark()
+            if cat_id != NULL_UUID:
+                mat_copy.asset_data.catalog_id = cat_id
+
+            try:
+                bpy.data.libraries.write(blend_path, {mat_copy}, compress=True)
+            finally:
+                bpy.data.materials.remove(mat_copy)
+
+            ok, msg = render_texture_preview(blend_path, self.shape)
+            if not ok:
+                self.report({'WARNING'}, f"{safe}: saved, but preview failed - {msg}")
+            elif msg:
+                self.report({'WARNING'}, f"{safe}: {msg}")
+            saved += 1
+
+        refresh_asset_browsers(context)
+        self.report({'INFO'}, f"Saved {saved} material(s) to library")
         return {'FINISHED'}
 
 
@@ -941,19 +1106,41 @@ def rewrite_asset_file(blend, cat_id, render=False, target_name=""):
             pass
 
 
-def read_catalog_paths(lib_dir):
+def read_catalog_lines(lib_dir):
+    """Returns [(uuid, path, simplename), ...] from blender_assets.cats.txt, in file order."""
     fp = os.path.join(lib_dir, CATS_FILE)
-    paths = []
+    lines = []
     if os.path.exists(fp):
         with open(fp, encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith("VERSION"):
+                s = line.strip()
+                if not s or s.startswith("#") or s.startswith("VERSION"):
                     continue
-                bits = line.split(":", 2)
+                bits = s.split(":", 2)
                 if len(bits) == 3:
-                    paths.append(bits[1])
-    return sorted(set(paths), key=str.lower)
+                    lines.append((bits[0], bits[1], bits[2]))
+    return lines
+
+
+def write_catalog_lines(lib_dir, entries):
+    fp = os.path.join(lib_dir, CATS_FILE)
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(CATS_HEADER)
+        for uid, path, simple in entries:
+            f.write(f"{uid}:{path}:{simple}\n")
+
+
+def prune_missing_catalogs(lib_dir):
+    """Removes catalog entries whose folder no longer exists on disk. Returns how many were removed."""
+    entries = read_catalog_lines(lib_dir)
+    kept = [e for e in entries if os.path.isdir(os.path.join(lib_dir, *_catalog_parts(e[1])))]
+    if len(kept) != len(entries):
+        write_catalog_lines(lib_dir, kept)
+    return len(entries) - len(kept)
+
+
+def read_catalog_paths(lib_dir):
+    return sorted({p for _, p, _ in read_catalog_lines(lib_dir)}, key=str.lower)
 
 
 def _folder_items(self, context):
@@ -1180,6 +1367,7 @@ def _header_draw(self, context):
         row.operator("modellib.save_selected", text="Save Selected", icon='ADD')
         row.operator("modellib.move_to_folder", text="Move to Folder", icon='FILE_FOLDER')
         row.operator("modellib.new_folder", text="New Folder", icon='NEWFOLDER')
+        row.operator("modellib.delete_folder", text="", icon='TRASH')
         row.operator("modellib.detect_folders", text="", icon='FILE_REFRESH')
 
         row2 = self.layout.row(align=True)
@@ -1210,8 +1398,9 @@ class MODELLIB_PT_panel(Panel):
         prefs = context.preferences.addons[__name__].preferences
         self.layout.operator("modellib.toggle_shelf", icon='ASSET_MANAGER', text="Open / Close Library")
         self.layout.operator("modellib.save_selected", icon='ADD')
-        self.layout.label(text="Open a texture in an Image Editor")
-        self.layout.label(text="to save it too (Save Texture).")
+        self.layout.operator("modellib.save_material", icon='MATERIAL', text="Save Material(s)")
+        self.layout.label(text="(Or open a texture in an Image")
+        self.layout.label(text="Editor to save it on its own.)")
         self.layout.prop(prefs, "library_path", text="")
 
 
@@ -1222,10 +1411,12 @@ class MODELLIB_PT_panel(Panel):
 classes = (
     MODELLIB_Preferences,
     MODELLIB_OT_save,
+    MODELLIB_OT_save_material,
     MODELLIB_OT_save_texture,
     MODELLIB_OT_set_preview_shape,
     MODELLIB_OT_move,
     MODELLIB_OT_new_folder,
+    MODELLIB_OT_delete_folder,
     MODELLIB_OT_detect_folders,
     MODELLIB_OT_toggle,
     MODELLIB_PT_panel,
