@@ -72,4 +72,4 @@ Detect Folders	Blender's folder list re-synced to match disk
 Dragging an asset into the viewport	Real, editable objects (Append, no instancing)
 If something goes wrong
 
-The add-on does some of its work (rendering previews, applying folders) using a background copy of Blender that runs invisibly for a few seconds. If a save or move doesn't seem to do anything, open Window → Toggle System Console (Windows only) before trying again — it will print exactly what that background step did or where it failed, which is the fastest way to work out what's wrong.
+The add-on does some of its work (rendering previews, applying folders) using a background copy of Blender that runs invisibly for a few seconds. If a save or move doesn't seem to do anything, open Window → Toggle System Console (Windows only) before trying again — it will print exactly what that background step did or where it failed, which is the fastest way to work out what's wrong. If you do run into a issue please make a issues ticket and ill fix it asap. 
